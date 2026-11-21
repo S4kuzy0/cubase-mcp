@@ -165,6 +165,34 @@ def _serialize(file, tracks):
     return output.getvalue()
 
 
+def controller_points(data, track_index, channel, controller, replacements=None, mode="replace"):
+    """Inspect or edit one standard MIDI CC lane using absolute ticks."""
+    file, tracks = load(data)
+    if not 0 <= track_index < len(tracks) or not 0 <= channel <= 15 or not 0 <= controller <= 119:
+        raise IntegrationError("INVALID_MIDI_CONTROLLER", "Use an existing track, MIDI channel 0–15 and controller 0–119.")
+
+    def matches(message):
+        return message.type == "control_change" and message.channel == channel and message.control == controller
+
+    events = tracks[track_index]
+    if replacements is None:
+        return [{"tick": tick, "value": message.value} for tick, _, message in events if matches(message)]
+    if mode not in {"replace", "merge"} or len(replacements) > 10000:
+        raise IntegrationError("INVALID_CONTROLLER_CHANGESET", "Use replace or merge and at most 10000 points.")
+    points = {row["tick"]: row["value"] for row in replacements}
+    if len(points) != len(replacements) or any(type(tick) is not int or type(value) is not int
+                                             or not 0 <= tick <= 0x0fffffff or not 0 <= value <= 127
+                                             for tick, value in points.items()):
+        raise IntegrationError("INVALID_CONTROLLER_POINTS", "Use distinct absolute ticks and CC values from 0 to 127.")
+    kept = [event for event in events
+            if not (matches(event[2]) and (mode == "replace" or event[0] in points))]
+    next_index = max((index for _, index, _ in events), default=-1) + 1
+    kept.extend([tick, index, mido.Message("control_change", channel=channel, control=controller, value=value)]
+                for index, (tick, value) in enumerate(sorted(points.items()), start=next_index))
+    tracks[track_index] = kept
+    return _serialize(file, tracks)
+
+
 def _note_events(note, channel, index):
     validate_change({"id": "_new", **note})
     start, duration = note["start_tick"], note["duration_tick"]

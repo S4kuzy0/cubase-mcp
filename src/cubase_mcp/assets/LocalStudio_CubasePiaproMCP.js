@@ -1,4 +1,4 @@
-// ES5 driver for Cubase LE 14. Control ports are separate from note input.
+// ES5 MIDI Remote driver. Control ports are separate from note input.
 var api = require('midiremote_api_v1');
 var driver = api.makeDeviceDriver('LocalStudio', 'CubasePiaproMCP', 'LocalStudio');
 var input = driver.mPorts.makeMidiInput('CP MCP To Cubase');
@@ -141,11 +141,26 @@ for (var commandIndex = 0; commandIndex < commands.length; ++commandIndex) {
     trigger.mMidiBinding.setInputPort(input).bindToControlChange(15, spec[0]);
     page.makeCommandBinding(trigger, spec[1], spec[2]).filterByValue(1);
 }
-page.mOnActivate = function () {
+var direct = typeof page.mHostAccess.makeDirectAccess === 'function'
+    ? page.mHostAccess.makeDirectAccess(channel) : null;
+var directMapping = null;
+var directMeter = null;
+page.mOnActivate = function (device, mapping) {
     active = true;
     session = String(new Date().getTime()) + '-' + String(Math.random());
+    if (direct && mapping) {
+        try {
+            direct.activate(mapping);
+            directMapping = mapping;
+        } catch (error) { directMapping = null; }
+    }
 };
 page.mOnDeactivate = function () {
+    if (directMapping) {
+        try { direct.deactivate(directMapping); } catch (error) {}
+    }
+    directMapping = null;
+    directMeter = null;
     active = false;
     clearEntry(selected);
     editorOpen = 127;
@@ -153,6 +168,170 @@ page.mOnDeactivate = function () {
     for (var kind in typeCache) {
         for (var item = 0; item < typeCache[kind].length; ++item) { clearEntry(typeCache[kind][item]); }
     }
+};
+
+// DirectAccess is an optional extension; older Cubase and existing clients
+// can continue using the transport and inventory protocol above.
+if (direct && channel.mValue.mVUMeter) {
+    page.makeValueBinding(driver.mSurface.makeCustomValueVariable('MCP selected channel meter'), channel.mValue.mVUMeter);
+    channel.mValue.mVUMeter.mOnProcessValueChange = function (device, mapping, value) {
+        if (isFinite(value) && selected.uid) {
+            directMeter = {uid:selected.uid, value:value, sampled_at_ms:new Date().getTime()};
+        }
+    };
+}
+
+function directObject(id) {
+    return {
+        id:id, title:direct.getObjectTitle(directMapping, id),
+        uid:direct.getObjectUniqueIDString(directMapping, id),
+        name:direct.getObjectUniqueName(directMapping, id),
+        type:direct.getObjectTypeName ? direct.getObjectTypeName(directMapping, id) : '',
+        children:direct.getNumberOfChildObjects(directMapping, id),
+        parameters:direct.getNumberOfParameters(directMapping, id)
+    };
+}
+
+function directParameter(id, tag) {
+    return {tag:tag, title:direct.getParameterTitle(directMapping, id, tag, 128),
+        value:direct.getParameterProcessValue(directMapping, id, tag),
+        display:direct.getParameterDisplayValue(directMapping, id, tag),
+        units:direct.getParameterDisplayUnits(directMapping, id, tag)};
+}
+
+function directSnapshot(id, request) {
+    var current = directObject(id);
+    var offset = request.offset || 0;
+    var index;
+    var tag;
+    current.child_page = [];
+    current.parameter_page = [];
+    for (index = offset; index < Math.min(offset + 24, current.children); ++index) {
+        current.child_page.push(directObject(direct.getChildObjectID(directMapping, id, index)));
+    }
+    for (index = offset; index < Math.min(offset + 24, current.parameters); ++index) {
+        tag = direct.getParameterTagByIndex(directMapping, id, index);
+        current.parameter_page.push(directParameter(id, tag));
+    }
+    return current;
+}
+
+function directTarget(request, base) {
+    var id = base;
+    for (var index = 0; index < request.path.length; ++index) {
+        var child = request.path[index];
+        if (child < 0 || child >= direct.getNumberOfChildObjects(directMapping, id)) {
+            throw new Error('OBJECT_PATH_CHANGED');
+        }
+        id = direct.getChildObjectID(directMapping, id, child);
+    }
+    // An object ID on its own cannot authorize writes after a selection,
+    // slot replacement, or host reload.
+    if (request.expected_id !== undefined) {
+        var object = directObject(id);
+        if (object.id !== request.expected_id || object.uid !== request.expected_uid ||
+            object.name !== request.expected_name || object.type !== request.expected_type) {
+            throw new Error('OBJECT_IDENTITY_CHANGED');
+        }
+    }
+    return id;
+}
+
+function directPluginCollection(id) {
+    var manager = direct.mPluginManager;
+    if (!manager || !manager.getIndexOfDefaultPluginCollection) { throw new Error('PLUGIN_API_UNAVAILABLE'); }
+    var index = manager.getIndexOfDefaultPluginCollection(directMapping, id);
+    var count = manager.getNumberOfPluginCollections(directMapping, id);
+    if (index < 0 || index >= count) { throw new Error('PLUGIN_COLLECTION_UNAVAILABLE'); }
+    var collection = manager.getPluginCollectionByIndex(directMapping, id, index);
+    if (!collection || !collection.mEntries) { throw new Error('PLUGIN_COLLECTION_UNAVAILABLE'); }
+    return collection;
+}
+
+function directRun(request) {
+    if (!active || request.session !== session || !selected.uid || request.track_uid !== selected.uid) {
+        throw new Error('TRACK_SELECTION_CHANGED');
+    }
+    if (!directMapping) { throw new Error('DIRECT_ACCESS_UNAVAILABLE'); }
+    if (request.op === 'meter') {
+        if (!directMeter || directMeter.uid !== selected.uid) { throw new Error('METER_SAMPLE_UNAVAILABLE'); }
+        return directMeter;
+    }
+    var base = direct.getBaseObjectID(directMapping);
+    if (!isFinite(base) || base < 0) { throw new Error('DIRECT_ACCESS_UNAVAILABLE'); }
+    var id = directTarget(request, base);
+    if (request.op === 'inspect') { return directSnapshot(id, request); }
+    if (request.op === 'plugin_catalog') {
+        var collection = directPluginCollection(id);
+        var start = request.offset || 0;
+        var catalog = [];
+        for (var i = start; i < Math.min(start + 32, collection.mEntries.length); ++i) {
+            var item = collection.mEntries[i];
+            catalog.push({uid:item.mPluginUID, name:item.mPluginName, vendor:item.mPluginVendor});
+        }
+        return {plugins:catalog, total:collection.mEntries.length, collection:collection.mName};
+    }
+    if (request.op === 'parameter_set' || request.op === 'parameter_read') {
+        var found = false;
+        var count = direct.getNumberOfParameters(directMapping, id);
+        for (var j = 0; j < count; ++j) {
+            if (direct.getParameterTagByIndex(directMapping, id, j) === request.tag) { found = true; break; }
+        }
+        if (!found) { throw new Error('PARAMETER_UNAVAILABLE'); }
+        var before = directParameter(id, request.tag);
+        if (before.title !== request.expected_title) { throw new Error('PARAMETER_CHANGED'); }
+        if (request.op === 'parameter_read') { return before; }
+        if (request.expected_id === undefined || cache.playing !== 0 || cache.recording !== 0) {
+            throw new Error('MUTATION_REQUIRES_STOPPED_IDENTIFIED_TARGET');
+        }
+        if (!isFinite(request.value) || request.value < 0 || request.value > 1 ||
+            !isFinite(request.expected_value) || !isFinite(before.value) ||
+            Math.abs(before.value - request.expected_value) > 0.00001) {
+            throw new Error('PARAMETER_CHANGED');
+        }
+        direct.setParameterProcessValue(directMapping, id, request.tag, request.value);
+        return {before:before, after:directParameter(id, request.tag), dispatched:true};
+    }
+    if (request.op === 'plugin_load') {
+        if (request.expected_id === undefined || cache.playing !== 0 || cache.recording !== 0) {
+            throw new Error('MUTATION_REQUIRES_STOPPED_IDENTIFIED_TARGET');
+        }
+        var plugins = directPluginCollection(id).mEntries;
+        if (!plugins.some(function (plugin) { return plugin.mPluginUID === request.plugin_uid; })) {
+            throw new Error('PLUGIN_NOT_IN_COLLECTION');
+        }
+        if (direct.getNumberOfChildObjects(directMapping, id) !== 0) { throw new Error('PLUGIN_SLOT_NOT_EMPTY'); }
+        return {dispatched:direct.mPluginManager.trySetSlotPlugin(directMapping, id, request.plugin_uid, false)};
+    }
+    throw new Error('UNKNOWN_DIRECT_COMMAND');
+}
+
+function sendDirectReply(device, nonce, result) {
+    var text = JSON.stringify(result);
+    var parts = Math.ceil(text.length / 180);
+    if (parts > 80) { text = '{"error":"DIRECT_REPLY_TOO_LARGE"}'; parts = 1; }
+    for (var part = 0; part < parts; ++part) {
+        var data = [240,125,67,80,7,nonce,part,parts];
+        for (var i = part * 180; i < Math.min(text.length, (part + 1) * 180); ++i) {
+            var code = text.charCodeAt(i);
+            data.push(code & 127, (code >> 7) & 127, (code >> 14) & 3);
+        }
+        data.push(247);
+        output.sendMidi(device, data);
+    }
+}
+
+input.mOnSysex = function (device, message) {
+    var start = message[0] === 240 ? 1 : 0;
+    var end = message.length - (message[message.length - 1] === 247 ? 1 : 0);
+    if (end - start < 7 || end - start > 850 || message[start] !== 125 ||
+        message[start + 1] !== 67 || message[start + 2] !== 80 || message[start + 3] !== 6) { return; }
+    var nonce = message[start + 4];
+    var text = '';
+    for (var i = start + 5; i < end; ++i) { text += String.fromCharCode(message[i]); }
+    try {
+        sendDirectReply(device, nonce, {result:directRun(JSON.parse(text))});
+    } catch (error) { sendDirectReply(device, nonce, {error:String(error.message || error)}); }
 };
 var versionQuery = driver.mSurface.makeCustomValueVariable('MCP inventory version query');
 versionQuery.mMidiBinding.setInputPort(input).bindToControlChange(15, 116);

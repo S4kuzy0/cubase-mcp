@@ -26,11 +26,18 @@ codex mcp add cubase -- (Resolve-Path .\.venv\Scripts\python.exe).Path -I -B -X 
 | --- | --- |
 | 走带与当前通道 | `daw_get_status`、`cubase_control`，校验播放、停止或当前通道状态回传 |
 | 实况轨道 | `cubase_list_tracks`、`cubase_select_track`、`cubase_add_track`，写入使用最新轨道清单版本 |
-| 标准 MIDI | `create_midi`、`edit_notes`、`transpose_notes`、`arrange_midi_notes`、`set_midi_track_patch` |
-| 工程与素材 | `inspect_project`、`cubase_create_project`、`cubase_create_audio_project`、`cubase_verify_midi_import` 与 MIDI Loop 工具 |
+| 标准 MIDI | `create_midi`、`edit_notes`、`transpose_notes`、`arrange_midi_notes`、`set_midi_track_patch`、`read_midi_controller_points`、`edit_midi_controller_points` |
+| 工程与素材 | `cubase_import_midi_native`、`cubase_save_project_as`、`cubase_export_project_wav`、`inspect_project`、模板与 MIDI Loop 工具 |
+| 混音 | `cubase_mix_channels` 批量读写音量、声像、静音、独奏 |
+| 宿主参数 | `cubase_inspect_channel` 和 `cubase_set_channel_parameter`，用于 DirectAccess 暴露的 EQ、发送及插件参数 |
+| 宿主插件槽与电平 | `cubase_list_slot_plugins`、`cubase_load_slot_plugin` 和 `cubase_read_channel_meter`，以实际通道能力及回传为准 |
 | 插件扫描记录 | `cubase_list_vst3_instruments`，读取本机 Cubase 缓存中的乐器类 |
 
-Cubase LE 16 已实测播放与停止回传。轨道清单上限为 64 个受支持的通道。旧 CPR 解析及 MIDI 导入校验适用于支持的 Cubase 14 RIF2 结构，MIDI 轨创建和路由的有界界面回退适用于已验证的 Cubase 14 英文布局。模板工具在新路径写副本。
+原生导入与另存已在英文 Cubase LE 16 工程副本实测。先检查 MIDI 的 SHA-256，再以新的 CPR 路径调用原生导入。工具回读保存后的起点、长度、音高、力度及通道。轨道清单上限为 64 个受支持的通道。CPR 回读只支持已识别的 RIF2 布局。
+
+WAV 工具以项目起点和全选事件的右定位点为范围。当前导出设置须显示 Stereo Out、WAV、工程目录下的 Mixdown 及 Always Ask，并显式允许有界对话框回退。工具在对话框填写独立文件名，核对 WAV 文件头和帧数，再交付到指定路径。提供预期秒数时会额外核对时长。
+
+DirectAccess 工具先读取通道对象和插件槽，写入时重新检查轨道、对象身份及旧值。精确支持范围由宿主版本和插件决定。电平返回最近一次宿主回传及采样时间。MIDI CC 点编辑按绝对 tick 操作标准 MIDI 文件中的控制器轨道。Cubase 工程中 VST 参数自动化轨的时间点没有公开的 MIDI Remote 编辑接口。
 
 冷启动后如果收到 `NO_CUBASE_FEEDBACK`，这一安装曾通过 **Reload Scripts** 恢复通信。播放与停止均已复验，冷启动自动恢复仍待验证。
 

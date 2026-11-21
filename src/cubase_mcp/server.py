@@ -10,17 +10,18 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict
 
-from . import __version__, audio_templates, cpr_midi, cubase, live_midi, midiloop
-from . import project_templates, projects, routing, storage, vst_catalog, windows
+from . import __version__, audio_templates, cpr_midi, cubase, live_midi, midi, midiloop
+from . import host_parameters, project_io, project_templates, projects, routing, storage, vst_catalog, windows
 from .errors import IntegrationError
 
 mcp = MCPServer(
     "cubase",
+    version=__version__,
     instructions=(
         "Cubase project, MIDI and host tools. Inspect before file writes and use the inspected SHA-256. "
         "Read live track IDs and their revision before track writes. Transport and mixer writes require host feedback. "
         "Routing is an explicit fallback for the validated Cubase 14 English layout. "
-        "Use the separate Piapro MCP to load a vocal instrument or edit a score."
+        "Use the separate Piapro MCP to edit a Piapro score."
     ),
 )
 READ = ToolAnnotations(
@@ -46,6 +47,27 @@ class AudioReplacement(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str
     expected_sha256: str
+
+
+class HostObjectIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: int
+    uid: str
+    name: str
+    type: str
+
+
+class MixChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    track_id: str
+    field: str
+    value: float
+
+
+class MidiControllerPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    tick: int
+    value: int
 
 
 class MidiNote(BaseModel):
@@ -84,6 +106,11 @@ def get_capabilities() -> dict:
         "track_creation": "audio and MIDI; MIDI uses the validated Cubase 14 English dialog fallback",
         "midi_routing": "validated Cubase 14 English inspector with explicit bounded fallback",
         "vst3_catalog": "configured Cubase scan cache; metadata is independent of plugin assignment",
+        "native_midi_import": "Cubase import followed by Save As and note comparison against the source",
+        "native_wav_mixdown": "new driver and verified native WAV settings; only project event extent and Stereo Out",
+        "multi_channel_mixer": "target-bound volume, pan, mute and solo with live readback",
+        "host_direct_access": "requires a compatible active Cubase API and updated driver; only host-exposed parameters and empty plugin slots",
+        "automation_points": "Standard MIDI CC point editing with readback; native plugin automation lanes are unavailable.",
         "state_dir": str(storage.state_dir()),
     }
 
@@ -286,6 +313,98 @@ def cubase_add_track(
     if track_type not in ("audio", "midi"):
         raise IntegrationError("UNSUPPORTED_TRACK_TYPE", "Use audio or midi. Piapro loading is in the Piapro MCP.")
     return cubase.add_track(track_type, name, expected_revision, allow_dialog_fallback)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_save_project_as(expected_project: str, output_path: str) -> dict:
+    """Use Cubase Save As and verify the new CPR file and active identity. Provide the exact current title's project name and a new filename. Audio media remains where Cubase stores it."""
+    return project_io.save_as(expected_project, output_path)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_import_midi_native(expected_project: str, midi_path: str, expected_sha256: str,
+                             output_cpr: str, expected_start_tick: int = 0,
+                             allow_dialog_fallback: bool = False) -> dict:
+    """Import into the current Cubase project and Save As a new checkpoint CPR. Source track names must be unique and absent from the target. Explicit dialog fallback answers the verified current-project import question. Checks native track identities and compares all imported notes in the checkpoint."""
+    return project_io.import_midi(expected_project, midi_path, expected_sha256, output_cpr,
+                                  expected_start_tick, allow_dialog_fallback)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_export_project_wav(project_path: str, output_path: str,
+                              expected_duration_seconds: float | None = None,
+                              allow_dialog_fallback: bool = False) -> dict:
+    """Select all project events, set locators from project start through the event extent and export native Stereo Out WAV. Requires verified stopped transport and the project Mixdown folder in the dialog. Supply an expected duration for independent range verification. The selection, locators and export filename change."""
+    return project_io.export_mixdown(project_path, output_path, expected_duration_seconds, allow_dialog_fallback)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_mix_channels(expected_revision: str, changes: list[MixChange]) -> dict:
+    """Change volume, pan, mute or solo for up to 32 explicit track/control pairs. Verifies host UID and change feedback, restores initial selection and reports any partial results."""
+    return host_parameters.mix_channels(expected_revision, [item.model_dump() for item in changes])
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_inspect_channel(track_id: str, expected_revision: str, object_path: list[int] | None = None,
+                           offset: int = 0) -> dict:
+    """Select the identified channel and discover the host's DirectAccess subobjects and current parameter values, including plugin, send and EQ nodes exposed by the installed host. Starting at the root, choose child indexes from an inspection."""
+    return host_parameters.inspect(track_id, expected_revision, object_path or [], offset)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_set_channel_parameter(track_id: str, expected_revision: str, object_path: list[int],
+                                 object_identity: HostObjectIdentity, parameter_tag: int,
+                                 parameter_title: str, value: float, expected_value: float) -> dict:
+    """Set one discovered plugin, send, EQ or channel parameter. Supply the object identity, parameter title and previous normalized value from readback. Returns actual before/after and verified status."""
+    return host_parameters.set_parameter(track_id, expected_revision, object_path, object_identity.model_dump(),
+                                         parameter_tag, parameter_title, value, expected_value)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_list_slot_plugins(track_id: str, expected_revision: str, object_path: list[int],
+                             offset: int = 0) -> dict:
+    """Select the identified channel and list the actual host catalog for a discovered instrument or insert slot."""
+    return host_parameters.plugin_catalog(track_id, expected_revision, object_path, offset)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_load_slot_plugin(track_id: str, expected_revision: str, object_path: list[int],
+                            object_identity: HostObjectIdentity, plugin_uid: str) -> dict:
+    """Request a plugin from the host's slot catalog for an empty slot. Existing plugin state is protected. A submitted request is separate from verified loaded-plugin identity."""
+    return host_parameters.load_plugin(track_id, expected_revision, object_path, object_identity.model_dump(), plugin_uid)
+
+
+@mcp.tool(annotations=WRITE)
+def cubase_read_channel_meter(track_id: str, expected_revision: str) -> dict:
+    """Select an identified track and read its most recent MIDI Remote meter sample with timestamp."""
+    return host_parameters.meter(track_id, expected_revision)
+
+
+@mcp.tool(annotations=READ)
+def read_midi_controller_points(path: str, track_index: int, channel: int, controller: int) -> dict:
+    """Read one SMF controller lane as absolute ticks. This does not address a native Cubase plugin automation lane."""
+    projects._require_midi_path(path)
+    source, data, sha = storage.read_file(path)
+    return {"path": str(source), "sha256": sha,
+            "points": midi.controller_points(data, track_index, channel, controller)}
+
+
+@mcp.tool(annotations=WRITE)
+def edit_midi_controller_points(path: str, output_path: str, expected_sha256: str, track_index: int,
+                                channel: int, controller: int, points: list[MidiControllerPoint],
+                                mode: str = "replace") -> dict:
+    """Merge or replace absolute-tick controller points on one track/channel/CC in a standard MIDI file, then read back the exported lane. Existing native Cubase plugin automation is outside this format."""
+    projects._require_midi_path(path)
+    projects._require_midi_path(output_path)
+    source, data, sha = projects.read_expected(path, expected_sha256)
+    result = midi.controller_points(data, track_index, channel, controller,
+                                    [point.model_dump() for point in points], mode)
+    observed = midi.controller_points(result, track_index, channel, controller)
+    wanted = {(point.tick, point.value) for point in points}
+    actual = {(point["tick"], point["value"]) for point in observed}
+    if not wanted <= actual or (mode == "replace" and actual != wanted):
+        raise IntegrationError("MIDI_CONTROLLER_UNVERIFIED", "Written controller points could not be verified.")
+    return storage.write_result(source, output_path, result, sha) | {"verified": True, "points": observed}
 
 
 def main():

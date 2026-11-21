@@ -83,7 +83,16 @@ def get_state():
         }
 
 
-def control(action: str, value: float | None = None):
+def _require_selected_channel(incoming, outgoing, expected_track):
+    if expected_track is None:
+        return
+    uid, revision = expected_track
+    current = _inventory(incoming, outgoing)
+    if current["revision"] != revision or current["selected"]["uid"] != uid:
+        raise IntegrationError("TRACK_SELECTION_CHANGED", "The requested channel no longer matches the selected host UID.")
+
+
+def control(action: str, value: float | None = None, *, expected_track=None):
     commands = {
         "play": (20, 1.0, "playing"),
         "stop": (21, 0.0, "playing"),
@@ -108,6 +117,7 @@ def control(action: str, value: float | None = None):
         mido.open_input(source) as incoming,
         mido.open_output(target) as outgoing,
     ):
+        _require_selected_channel(incoming, outgoing, expected_track)
         before = _query(incoming, outgoing)
         if before[field] is not None and abs(before[field] - wanted) <= 1 / 126:
             return {
@@ -138,6 +148,7 @@ def control(action: str, value: float | None = None):
                 else 0
             )
             if stable >= 3:
+                _require_selected_channel(incoming, outgoing, expected_track)
                 return {
                     "verified": True,
                     "action": action,
