@@ -1,5 +1,7 @@
 # Cubase MCP
 
+Cubase MCP 的后续维护在[合并仓库的 Cubase MCP 目录](https://github.com/S4kuzy0/cubase-piapro-mcp/tree/codex/piapro-split/cubase-mcp)。新安装请使用该目录的说明。此仓库保留既有源码、安装说明和历史，供旧地址和现有检出继续使用。
+
 在 Windows 上通过 MCP 控制 Cubase，并离线检查、创建和校验 Cubase 工程素材。Piapro 乐谱与歌声编辑由 [Piapro MCP](https://github.com/S4kuzy0/cubase-piapro-mcp) 提供。
 
 ## 安装与连接
